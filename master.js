@@ -1,10 +1,8 @@
 const admin = require('firebase-admin');
 const http = require('http');
 
-// Učitavanje konfiguracije iz Render Environment Variables
+// 1. Inicijalizacija Firebase-a preko Environment Varijable
 const serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
-
-// Popravka za privatni ključ (rešava problem sa novim redovima)
 serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
 
 admin.initializeApp({
@@ -15,73 +13,77 @@ admin.initializeApp({
 const db = admin.database();
 const DEVICE_ID = "SN_PLAST_01";
 
-// Funkcija za formatiranje datuma u DD-M-YYYY (kako tvoja aplikacija zahteva)
+// Pomoćna funkcija za format datuma DD-M-YYYY
 function getFmtDate(d) {
     return `${d.getDate()}-${d.getMonth() + 1}-${d.getFullYear()}`;
 }
 
-// --- 1. FUNKCIJA ZA PAMETNO I BRZO UPISIVANJE ---
+// --- GLAVNA FUNKCIJA ZA ISTORIJU I OSVEŽAVANJE ---
 async function saveToHistory() {
     try {
         const now = new Date();
         const dateStr = getFmtDate(now);
         const hh = String(now.getHours()).padStart(2, '0');
-        
-        // Provera poslednjeg upisa u trenutnom satu
+        const mm = String(now.getMinutes()).padStart(2, '0');
+        const ts = now.getTime();
+        const vremeString = now.toLocaleTimeString('sr-RS', { hour: '2-digit', minute: '2-digit' });
+
+        // A. Provera da li je podatak već upisan u poslednjih 55 sekundi
         const hourRef = db.ref(`history/${DEVICE_ID}/${dateStr}/${hh}`);
         const hourSnap = await hourRef.once('value');
 
         if (hourSnap.exists()) {
             const entries = hourSnap.val();
             let lastTs = 0;
-
-            // Pronalazimo najnoviji timestamp u bazi
             Object.keys(entries).forEach(minKey => {
                 const minData = entries[minKey];
                 Object.keys(minData).forEach(tsKey => {
-                    const ts = parseInt(tsKey);
-                    if (ts > lastTs) lastTs = ts;
+                    const t = parseInt(tsKey);
+                    if (t > lastTs) lastTs = t;
                 });
             });
 
-            const diffSeconds = (now.getTime() - lastTs) / 1000;
-
-            // Ako je neko (App ili Server) upisao pre manje od 55 sekundi, preskačemo
+            const diffSeconds = (ts - lastTs) / 1000;
             if (diffSeconds < 55) {
+                // Već postoji svež upis, preskačemo da ne dupliramo aplikaciju
                 return; 
             }
         }
 
-        // Uzimanje trenutnih podataka sa uređaja (ESP8266)
-        const deviceSnap = await db.ref(`devices/${DEVICE_ID}`).once('value');
+        // B. Uzimanje podataka iz čvora 'uredjaji' (kako je na slici)
+        const deviceSnap = await db.ref(`uredjaji/${DEVICE_ID}`).once('value');
         if (!deviceSnap.exists()) {
-            console.log("ESP8266 nije poslao podatke, preskačem upis.");
+            console.log("Upozorenje: Čvor uredjaji/SN_PLAST_01 ne postoji u bazi.");
             return;
         }
 
         const data = deviceSnap.val();
-        const mm = String(now.getMinutes()).padStart(2, '0');
-        const ts = now.getTime();
 
-        // Upis u istoriju
+        // C. Upis u ISTORIJU (za grafik u aplikaciji)
         await db.ref(`history/${DEVICE_ID}/${dateStr}/${hh}/${mm}/${ts}`).set({
             temp: parseFloat(data.temp) || 0,
             vlaga: parseFloat(data.vlaga) || 0,
             vlaga_tla: parseFloat(data.vlaga_tla) || 0,
             timestamp: ts,
-            time: now.toLocaleTimeString('sr-RS', { hour: '2-digit', minute: '2-digit' })
+            time: vremeString
         });
 
-        console.log(`⏱️ Podatak upisan: ${hh}:${mm}:${now.getSeconds()}s`);
+        // D. Ažuriranje tajmera u glavnom čvoru (da aplikacija vidi da je osveženo)
+        await db.ref(`uredjaji/${DEVICE_ID}`).update({
+            zadnje_osvezavanje: vremeString,
+            zadnji_update: ts
+        });
+
+        console.log(`⏱️ [${vremeString}] Uspešno ažurirana istorija i status uređaja.`);
 
     } catch (error) {
-        console.error("Greška pri upisu:", error);
+        console.error("Greška u saveToHistory:", error);
     }
 }
 
-// --- 2. FUNKCIJA ZA ČIŠĆENJE STARE ISTORIJE ---
+// --- FUNKCIJA ZA ČIŠĆENJE STARIH PODATAKA (3 DANA) ---
 async function cleanOldHistory() {
-    console.log("Pokrećem automatsko čišćenje baze (starije od 3 dana)...");
+    console.log("Pokrećem proveru za brisanje starih podataka...");
     const ref = db.ref(`history/${DEVICE_ID}`);
     
     try {
@@ -98,29 +100,33 @@ async function cleanOldHistory() {
             const folderDate = new Date(parts[2], parts[1] - 1, parts[0]);
 
             if (folderDate < limit) {
-                console.log(`🗑️ Obrisano: ${dateStr}`);
+                console.log(`🗑️ Brišem istoriju za datum: ${dateStr}`);
                 child.ref.remove();
             }
         });
     } catch (error) {
-        console.error("Greška pri čišćenju:", error);
+        console.error("Greška u cleanOldHistory:", error);
     }
 }
 
-// --- TAJMERI ---
+// --- TAJMERI I SERVER ---
 
-// Proveravaj i upisuj svakih 30 sekundi
+// Provera na svakih 30 sekundi
 setInterval(saveToHistory, 30 * 1000);
 
-// Čisti bazu svakih 12 sati
+// Čišćenje baze na svakih 12 sati
 setInterval(cleanOldHistory, 12 * 60 * 60 * 1000);
 
-// Pokreni odmah pri startu
+// Pokreni odmah pri startovanju servera
 saveToHistory();
 cleanOldHistory();
 
-// HTTP server da Render ne ugasi aplikaciju
-http.createServer((req, res) => {
-  res.writeHead(200, {'Content-Type': 'text/plain'});
-  res.end('Smart Greenhouse Server is Active\n');
-}).listen(process.env.PORT || 3000);
+// Minimalni HTTP server za Render
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Pametni Plastenik Server je aktivan i prati čvor "uredjaji".\n');
+});
+
+server.listen(process.env.PORT || 3000, () => {
+  console.log("Server je pokrenut i sluša...");
+});
